@@ -7,7 +7,7 @@ from matplotlib.animation import FuncAnimation
 # Define parking lot dimensions and DEM resolution
 length = 100.0  # in meters
 width = 40.0    # in meters
-resolution = 0.25  # DEM resolution in meters
+resolution = 0.5  # DEM resolution in meters
 
 # Create a grid for the DEM
 nx = int(length / resolution)  # Number of grid points along length
@@ -50,55 +50,60 @@ runoff_volume = np.maximum(0, rainfall_volume - infiltration_volume)
 # Runoff_volume now contains the water available for surface flow in each cell
 print(f"Runoff Volume in each cell: {runoff_volume}")
 
-# Initialize a flow direction matrix
+# Initialize flow direction and accumulation matrices
 flow_direction = np.zeros_like(dem, dtype=int)
+flow_accumulation = np.zeros_like(dem)
 
-# Define the directions: N, NE, E, SE, S, SW, W, NW
+# Define directions: N, NE, E, SE, S, SW, W, NW
 directions = [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]
+
+# Define Manning's roughness coefficient for sand
+n_manning = 0.025
+
+# Time step for simulation (e.g., 1 second)
+time_step = 1  # seconds
+
+# Convert the hourly runoff volume to per-second volume
+runoff_volume_per_step = runoff_volume / 3600  # As runoff_volume was calculated per hour
 
 # Iterate over each cell in the DEM
 for i in range(1, nx-1):
     for j in range(1, ny-1):
+        # Determine flow direction based on minimum elevation
         min_elevation = dem[i, j]
         min_dir = 0
-        # Check all 8 neighbors
         for k, (di, dj) in enumerate(directions):
             ni, nj = i + di, j + dj
             if dem[ni, nj] < min_elevation:
                 min_elevation = dem[ni, nj]
                 min_dir = k
-        flow_direction[i, j] = min_dir  # Assign the flow direction index
+        flow_direction[i, j] = min_dir
 
-# Define Manning's roughness coefficient for sand
-n_manning = 0.025
-
-# Initialize flow accumulation matrix
-flow_accumulation = np.zeros_like(dem)
-
-# Flow velocity and routing calculation
+# Flow velocity and routing calculation with consideration of slopes
 for i in range(1, nx-1):
     for j in range(1, ny-1):
-        # Current cell runoff volume
-        inflow = runoff_volume
-        
-        # Flow direction and velocity calculation
-        direction = flow_direction[i, j]
-        di, dj = directions[direction]
-        ni, nj = i + di, j + dj
-        
-        # Calculate slope between current cell and downstream cell
-        slope = (dem[i, j] - dem[ni, nj]) / resolution
-        
-        # Calculate flow velocity using Manning's equation
-        # Assuming hydraulic radius R as depth of flow; simplify to depth = runoff_volume / cell area
-        depth = runoff_volume / (resolution * resolution)  # Simplified depth estimation
-        velocity = (1 / n_manning) * (depth ** (2/3)) * (slope ** 0.5)
-        
-        # Calculate the water that will flow from current cell to the next based on velocity
-        flow = velocity * resolution * resolution  # Flow rate in cubic meters per second
-        
-        # Update the flow accumulation for the downstream cell
-        flow_accumulation[ni, nj] += inflow + flow
+        # Outflow and inflow initialization
+        outflow = 0
+        inflow = runoff_volume_per_step
+
+        # Calculate slope and velocity for each neighboring cell
+        for k, (di, dj) in enumerate(directions):
+            ni, nj = i + di, j + dj
+            elevation_change = dem[i, j] - dem[ni, nj]
+            
+            if elevation_change > 0:  # Outflow only for downhill neighbors
+                # Calculate slope and velocity
+                slope = elevation_change / resolution
+                depth = runoff_volume_per_step / (resolution * resolution)  # Simplified depth estimation
+                velocity = (1 / n_manning) * (depth ** (2/3)) * (slope ** 0.5)
+
+                # Flow contribution to the neighbor
+                flow_contribution = velocity * resolution * resolution * time_step
+                flow_accumulation[ni, nj] += flow_contribution
+                outflow += flow_contribution
+
+        # Update inflow for the current cell
+        flow_accumulation[i, j] += inflow - outflow
 
 # Determine the exit location (e.g., bottom middle of the parking lot)
 exit_cells = [(nx-1, ny//2 + i) for i in range(-5, 5)]  # Example: 10 cells centered at the bottom middle
@@ -108,7 +113,7 @@ flow_rate_at_exit = sum(flow_accumulation[ex, ey] for ex, ey in exit_cells)
 
 print(f"Flow rate at the exit (in cubic meters per hour): {flow_rate_at_exit}")
 
-# Create a figure and axis for the plot
+# Initialize a figure and axis for the plot
 fig = plt.figure(figsize=(10, 7))
 ax = fig.add_subplot(111, projection='3d')
 
@@ -118,72 +123,69 @@ X, Y = np.meshgrid(np.linspace(0, width, ny), np.linspace(0, length, nx))
 # Initialize the surface plot
 surface = ax.plot_surface(X, Y, dem, cmap='terrain', edgecolor='none')
 
-# Initialize an array to represent water depth and velocity directions
-water_depth = np.zeros_like(dem)
-flow_velocity = np.zeros_like(dem)
+# Initialize flow accumulation with the DEM values
+flow_accumulation = np.copy(dem)
 
-# Add a start time variable
-start_time = tm.time()
+# Define Manning's roughness coefficient for sand
+n_manning = 0.025
+
 # Function to update the animation for each frame
 def update(frame):
-    global water_depth, flow_velocity
+    global flow_accumulation
 
-    # Simulate water flow by updating water depth according to flow direction and rainfall
-    new_water_depth = np.zeros_like(water_depth) + runoff_volume  # Adding rainfall to each cell
-    flow_velocity = np.zeros((nx, ny))
+    # Copy the flow accumulation to avoid modifying it during iteration
+    new_flow_accumulation = np.copy(flow_accumulation)
 
+    # Flow velocity and routing calculation with consideration of slopes
     for i in range(1, nx-1):
         for j in range(1, ny-1):
-            direction = flow_direction[i, j]
-            di, dj = directions[direction]
-            ni, nj = i + di, j + dj
-            
-            # Move water based on flow direction (flowing to the downstream cell)
-            new_water_depth[ni, nj] += water_depth[i, j]
-            
-            # Calculate slope between current cell and downstream cell
-            slope = (dem[i, j] - dem[ni, nj]) / resolution
-            
-            # Calculate flow velocity using Manning's equation (with simplified hydraulic radius)
-            depth = max(water_depth[i, j], 0.01)  # Use a minimum depth to avoid zero division
-            velocity = (1 / n_manning) * (depth ** (2/3)) * (slope ** 0.5)
-            flow_velocity[i, j] = velocity
+            # Outflow and inflow initialization
+            outflow = 0
+            inflow = runoff_volume_per_step
 
-    # Update water depth
-    water_depth = new_water_depth
+            # Calculate slope and velocity for each neighboring cell
+            for k, (di, dj) in enumerate(directions):
+                ni, nj = i + di, j + dj
+
+                # Check if the neighbor is within the grid bounds
+                if 0 <= ni < nx and 0 <= nj < ny:
+                    elevation_change = dem[i, j] - dem[ni, nj]
+
+                    if elevation_change > 0:  # Outflow only for downhill neighbors
+                        # Calculate slope and velocity
+                        slope = elevation_change / resolution
+                        depth = runoff_volume_per_step / (resolution * resolution)  # Simplified depth estimation
+                        velocity = (1 / n_manning) * (depth ** (2/3)) * (slope ** 0.5)
+
+                        # Flow contribution to the neighbor
+                        flow_contribution = velocity * resolution * resolution * time_step
+                        new_flow_accumulation[ni, nj] += flow_contribution
+                        outflow += flow_contribution
+
+            # Update inflow for the current cell
+            new_flow_accumulation[i, j] += inflow - outflow
+
+    # Update flow accumulation
+    flow_accumulation = new_flow_accumulation
 
     # Clear the plot
     ax.clear()
     
-    # Update the plot by plotting water depth on the surface with terrain
+    # Update the plot by plotting flow accumulation on the surface with terrain
     ax.plot_surface(X, Y, dem, cmap='terrain', edgecolor='none', alpha=0.7)
     
-    # Plot water depth separately
-    water_surface = ax.plot_surface(X, Y, dem + water_depth, cmap='Blues', edgecolor='none', alpha=0.5)
+    # Plot flow accumulation as a color map
+    flow_surface = ax.plot_surface(X, Y, flow_accumulation, cmap='Blues', edgecolor='none', alpha=0.5)
     
-    # Add quiver plot for velocity visualization
-    i_indices, j_indices = np.unravel_index(np.arange(0, nx*ny, 10), (nx, ny))
-    
-    # Calculate the angles for the quiver plot
-    angles = np.array([np.arctan2(directions[flow_direction[i, j]][1], 
-                                  directions[flow_direction[i, j]][0]) 
-                       for i, j in zip(i_indices, j_indices)])
-    
-    ax.quiver(X[i_indices, j_indices], Y[i_indices, j_indices], dem[i_indices, j_indices], 
-              flow_velocity[i_indices, j_indices] * np.cos(angles),
-              flow_velocity[i_indices, j_indices] * np.sin(angles),
-              0, length=0.2, normalize=True, color='r')
-    
-    ax.set_zlim(np.min(dem), np.max(dem) + np.max(water_depth))
+    ax.set_zlim(np.min(dem), np.max(flow_accumulation))
     ax.set_xlabel('Width (m)')
     ax.set_ylabel('Length (m)')
-    ax.set_zlabel('Elevation + Water Depth (m)')
-    ax.set_title('Water Flow Simulation')
+    ax.set_zlabel('Flow Accumulation (cubic meters)')
+    ax.set_title('Flow Accumulation Simulation')
 
 # Create an animation
-ani = FuncAnimation(fig, update, frames=None, interval=10000, repeat=False, cache_frame_data=False)
+ani = FuncAnimation(fig, update, frames="None", interval=100, repeat=False, cache_frame_data=False)
 # Save animation
-# ani.save('simulation.gif')
+# ani.save('flow_accumulation_simulation_multidirection.gif')
 
 plt.show()
-
